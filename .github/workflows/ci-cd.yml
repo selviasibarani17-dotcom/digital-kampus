@@ -1,0 +1,67 @@
+name: CI-CD Aplikasi Digital Kampus
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+jobs:
+  # 1. TAHAP BUILD & TEST
+  build-test:
+    name: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Simulasi Install Dependencies & Test
+        run: |
+          echo "Menjalankan npm install..."
+          echo "Menjalankan Unit Test (Jest/JUnit)..."
+          echo "✅ Automated Testing Berhasil!"
+
+  # 2. TAHAP SECURITY SCAN (TRIVY)
+  security-scan:
+    name: security-scan
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulasi Pemindaian Keamanan (Trivy)
+        run: |
+          echo "Memindai kerentanan pada kode dan dependensi..."
+          echo "✅ Security Scan Selesai, tidak ada kerentanan kritis."
+
+  # 3. TAHAP DOCKER IMAGE
+  docker-image:
+    name: docker-image
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulasi Build Docker Image
+        run: |
+          echo "Membangun Docker Image: akademik-app:latest"
+          echo "✅ Docker Image Berhasil Dibuat!"
+
+  # 4. TAHAP DEPLOY STAGING
+  deploy-staging:
+    name: deploy-staging
+    needs: docker-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulasi Deploy ke Staging
+        run: |
+          echo "Deploy ke lingkungan Staging..."
+          echo "✅ Deploy Staging Berhasil!"
+
+  # 5. TAHAP DEPLOY PRODUCTION (MENUNGGU APPROVAL)
+  deploy-production:
+    name: deploy-production
+    needs: docker-image
+    runs-on: ubuntu-latest
+    environment: production # Ini akan memicu fitur "Waiting/Review required" di GitHub
+    steps:
+      - name: Deploy ke Production
+        run: |
+          echo "Deploy ke production"
+          echo "✅ Deploy Production Berhasil!"
