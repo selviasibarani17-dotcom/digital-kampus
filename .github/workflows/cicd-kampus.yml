@@ -1,0 +1,166 @@
+name: CI-CD Aplikasi Digital Kampus
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+  id-token: write        # untuk OIDC ke AWS (tanpa kunci statis)
+  security-events: write
+
+env:
+  AWS_REGION: ap-southeast-3
+  ECR_REPOSITORY: akademik-app
+  EKS_CLUSTER_STAGING: kampus-staging
+  EKS_CLUSTER_PROD: kampus-prod
+
+jobs:
+  # ---------- CONTINUOUS INTEGRATION ----------
+  ci:
+    name: Lint, Test, Quality, Security
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: akademik_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Unit dan integrasi test
+        run: npm test -- --coverage
+        env:
+          DB_HOST: 127.0.0.1
+          DB_NAME: akademik_test
+          DB_USER: root
+          DB_PASS: root
+      - name: Analisis SonarQube
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      - name: Pemindaian rahasia (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Audit dependensi
+        run: npm audit --audit-level=high
+
+  # ---------- BUILD, SCAN, PUSH IMAGE ----------
+  build:
+    name: Build dan Push Image
+    needs: ci
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Konfigurasi kredensial AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login ke ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Tentukan tag image
+        id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        run: |
+          docker build -t ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }} .
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Push image ke ECR
+        run: |
+          docker push ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+
+  # ---------- DEPLOY STAGING ----------
+  deploy-staging:
+    name: Deploy ke Staging
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_STAGING }} --region ${{ env.AWS_REGION }}
+      - name: Helm upgrade (staging)
+        run: |
+          helm upgrade --install akademik ./helm/akademik \
+            --namespace staging --create-namespace \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            -f helm/akademik/values-staging.yaml \
+            --atomic --timeout 5m
+      - name: Tes E2E (Playwright)
+        run: |
+          npm ci
+          npx playwright install --with-deps
+          npx playwright test
+        env:
+          BASE_URL: https://staging.siakad.namakampus.ac.id
+
+  # ---------- DEPLOY PRODUCTION (WAJIB PERSETUJUAN MANUAL) ----------
+  deploy-production:
+    name: Deploy ke Production
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production      # required reviewers: QA, Ops, Tech Lead
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_PROD }} --region ${{ env.AWS_REGION }}
+      - name: Helm upgrade (production, rolling, atomic)
+        run: |
+          helm upgrade --install akademik ./helm/akademik \
+            --namespace production \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            -f helm/akademik/values-production.yaml \
+            --atomic --timeout 10m
+      - name: Smoke test
+        run: |
+          curl --fail --silent --show-error https://siakad.namakampus.ac.id/health
+      - name: Rollback otomatis jika smoke test gagal
+        if: failure()
+        run: helm rollback akademik --namespace production --wait
+      - name: Notifikasi Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: '{"text":"Deploy production ${{ job.status }} - versi ${{ needs.build.outputs.image_tag }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
